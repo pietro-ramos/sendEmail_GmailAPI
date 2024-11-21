@@ -1,3 +1,34 @@
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore IDE configuration directories
+.idea/
+
+# Ignore log files
+*.log
+
+# Ignore data files
+data/
+*.xlsx
+
+# Ignore credentials and token files
+credentials.json
+token.json
+
+# Ignore specific files
+corpos_emails_para_analise.txt
+emails_sem_destinatario.txt
+
+# Ignore virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
