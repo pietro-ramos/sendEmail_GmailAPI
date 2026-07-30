@@ -1,19 +1,16 @@
 import logging
-import mimetypes
-import os
 import re
 import smtplib
 import ssl
 import time
-from email import encoders
-from email.mime.application import MIMEApplication
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from typing import Any, Dict, List, Optional, Tuple
+from email.message import EmailMessage
 
 from services.email_template import renderizar_template_email
-from util.input_excel import gerar_nomes_candidatos_carta
+from services.pdf_files import localizar_pdfs, nome_anexo
+
+
+logger = logging.getLogger(__name__)
+TRANSIENT_SMTP_CODES = {421, 450, 451, 452}
 
 
 class SmtpEmailService:
@@ -24,267 +21,168 @@ class SmtpEmailService:
         username: str,
         password: str,
         remetente: str,
-        security_mode: str = "auto",
-        timeout: int = 60,
+        security_mode: str = "starttls",
+        timeout: float = 60.0,
         require_auth: bool = True,
-        rate_limit_per_min: int = 120,
-        rate_limit_window_seconds: int = 60,
+        rate_limit: int = 40,
+        rate_limit_window_seconds: int = 3600,
         retries: int = 3,
-        cartas_dir: Optional[str] = None,
-        require_pdf: bool = True,
-    ):
+        retry_delay_seconds: float = 5.0,
+        cartas_dir: str = "data/cartas",
+    ) -> None:
         self.smtp_host = (smtp_host or "").strip()
         self.smtp_port = int(smtp_port)
         self.username = (username or "").strip()
         self.password = password or ""
-        self.remetente = remetente
-        self.security_mode = (security_mode or "auto").strip().lower()
-        self.timeout = int(timeout)
+        self.remetente = (remetente or "").strip()
+        self.security_mode = (security_mode or "starttls").strip().lower()
+        self.timeout = float(timeout)
         self.require_auth = require_auth
-        self.rate_limit_per_min = rate_limit_per_min
+        self.rate_limit = int(rate_limit)
         self.rate_limit_window_seconds = int(rate_limit_window_seconds)
-        self.retries = retries
+        self.retries = int(retries)
+        self.retry_delay_seconds = float(retry_delay_seconds)
         self.cartas_dir = cartas_dir
-        self.require_pdf = require_pdf
         self._sent_in_window = 0
-        self._window_start = time.time()
+        self._window_start = time.monotonic()
+        self._validate_configuration()
 
-        logging.basicConfig(
-            filename="email_log.log",
-            level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-        )
+    def _validate_configuration(self) -> None:
+        if not self.smtp_host:
+            raise ValueError("SMTP_HOST não configurado.")
+        if not self.remetente:
+            raise ValueError("EMAIL_REMETENTE_SMTP não configurado.")
+        if self.smtp_port < 1:
+            raise ValueError("SMTP_PORT deve ser maior que zero.")
+        if self.security_mode not in {"auto", "none", "starttls", "ssl"}:
+            raise ValueError(
+                "SMTP_SECURITY inválido. Use auto, none, starttls ou ssl."
+            )
+        if self.require_auth and not self.username:
+            raise ValueError("SMTP_USERNAME não configurado.")
+        if self.require_auth and not self.password:
+            raise ValueError("SMTP_PASSWORD não configurado.")
+        if self.rate_limit < 1:
+            raise ValueError("SMTP_RATE_LIMIT deve ser maior que zero.")
+        if self.rate_limit_window_seconds < 1:
+            raise ValueError("SMTP_RATE_WINDOW_SECONDS deve ser maior que zero.")
+        if self.retries < 1:
+            raise ValueError("SMTP_RETRIES deve ser maior que zero.")
+        if self.retry_delay_seconds < 0:
+            raise ValueError("SMTP_RETRY_DELAY_SECONDS não pode ser negativo.")
+        if self.timeout <= 0:
+            raise ValueError("SMTP_TIMEOUT deve ser maior que zero.")
 
     def enviar_emails_em_massa(
         self,
         lista_credores,
         assunto: str,
         template: str,
-        imagem_path: str,
-    ) -> List[Dict[str, Any]]:
-        logs_envio = []
+    ) -> list[dict[str, str]]:
+        resultados = []
         for credor in lista_credores:
-            status, erro = self._enviar_para_credor(
-                credor,
-                assunto,
-                template,
-                imagem_path,
-            )
-            logs_envio.append(
+            try:
+                destinatario, message = self._build_message(
+                    credor,
+                    assunto,
+                    template,
+                )
+                status, erro = self._send_with_retries(destinatario, message)
+            except Exception as exc:
+                logger.exception("Falha ao preparar e-mail para %s", credor.email)
+                status, erro = "Falha", str(exc)
+
+            resultados.append(
                 {
                     "Destinatario": credor.email,
                     "Status do envio": status,
                     "Erro": erro,
                 }
             )
-            logging.info(
-                f"Email para {credor.email} - Status: {status} - Erro: {erro}"
-            )
-        return logs_envio
-
-    def _enviar_para_credor(
-        self,
-        credor,
-        assunto: str,
-        template: str,
-        imagem_path: str,
-    ) -> Tuple[str, str]:
-        destinatario, message = self._build_message(
-            credor,
-            assunto,
-            template,
-            imagem_path,
-        )
-        if message is None or not destinatario:
-            return "Falha", "Erro ao montar mensagem"
-        return self._send_with_retries(destinatario, message)
+        return resultados
 
     def _build_message(
         self,
         credor,
         assunto: str,
         template: str,
-        imagem_path: str,
-    ) -> Tuple[str, Optional[MIMEMultipart]]:
-        try:
-            destinatario = re.sub(
-                r"\s+",
-                "",
-                str(credor.email or "").replace("\u00a0", ""),
-            ).strip()
-            if not destinatario:
-                logging.error(f"Email vazio para {credor.nome}")
-                return "", None
-
-            corpo_html = renderizar_template_email(template, credor)
-
-            message = MIMEMultipart("mixed")
-            message["From"] = self.remetente
-            message["To"] = destinatario
-            message["Subject"] = assunto
-
-            related = MIMEMultipart("related")
-            alternative = MIMEMultipart("alternative")
-            texto_plano = (
-                f"Prezado(a) {credor.nome}, segue comunicado importante em anexo."
-                if self.require_pdf
-                else f"Prezado(a) {credor.nome}, segue comunicado importante no corpo deste email."
-            )
-            alternative.attach(
-                MIMEText(
-                    texto_plano,
-                    "plain",
-                    "utf-8",
-                )
-            )
-            alternative.attach(MIMEText(corpo_html, "html", "utf-8"))
-            related.attach(alternative)
-
-            self._attach_inline_image(related, imagem_path)
-            message.attach(related)
-
-            anexos = self._find_pdf_paths(credor)
-            if not anexos and self.require_pdf:
-                raise FileNotFoundError(f"PDF obrigatorio ausente para {credor.nome}")
-
-            for idx, pdf_path in enumerate(anexos):
-                with open(pdf_path, "rb") as pdf_file:
-                    part = MIMEApplication(pdf_file.read(), _subtype="pdf")
-                if idx == 0:
-                    filename = f"Comunicado - {credor.nome}.pdf"
-                else:
-                    filename = f"Comunicado - {credor.nome} ({idx + 1}).pdf"
-                part.add_header("Content-Disposition", "attachment", filename=filename)
-                message.attach(part)
-
-            return destinatario, message
-        except Exception as exc:
-            logging.error(
-                f"Erro ao criar mensagem para {credor.email}: {exc}",
-                exc_info=True,
-            )
-            return "", None
-
-    def _attach_inline_image(self, related_message: MIMEMultipart, imagem_path: str) -> None:
-        imagem_path = (imagem_path or "").strip()
-        if not imagem_path:
-            return
-
-        imagem_path_norm = os.path.normpath(imagem_path)
-        if not os.path.exists(imagem_path_norm):
-            logging.warning(f"Imagem inline nao encontrada: {imagem_path_norm}")
-            return
-
-        content_type, _ = mimetypes.guess_type(imagem_path_norm)
-        if not content_type:
-            content_type = "image/png"
-        maintype, subtype = content_type.split("/", 1)
-
-        with open(imagem_path_norm, "rb") as img_file:
-            image_part = MIMEBase(maintype, subtype)
-            image_part.set_payload(img_file.read())
-
-        encoders.encode_base64(image_part)
-        image_part.add_header("Content-ID", "<imagem1>")
-        image_part.add_header(
-            "Content-Disposition",
-            "inline",
-            filename=os.path.basename(imagem_path_norm),
+    ) -> tuple[str, EmailMessage]:
+        destinatario = re.sub(
+            r"\s+",
+            "",
+            str(credor.email or "").replace("\u00a0", ""),
         )
-        related_message.attach(image_part)
+        if not destinatario:
+            raise ValueError(f"E-mail vazio para {credor.nome}.")
 
-    def _find_pdf_paths(self, credor) -> List[str]:
-        if not self.cartas_dir:
-            return []
-        if not os.path.isdir(self.cartas_dir):
-            logging.warning(f"Diretorio de cartas nao encontrado: {self.cartas_dir}")
-            return []
+        pdf_paths = localizar_pdfs(self.cartas_dir, credor)
+        if not pdf_paths:
+            raise FileNotFoundError(f"PDF obrigatório ausente para {credor.nome}.")
 
-        candidatos = gerar_nomes_candidatos_carta(
-            credor.nome,
-            credor.cpf_cnpj,
-            credor.classe,
+        message = EmailMessage()
+        message["From"] = self.remetente
+        message["To"] = destinatario
+        message["Subject"] = assunto
+        message.set_content(
+            f"Prezado(a) {credor.nome}, segue comunicado importante em anexo."
         )
-        for filename in candidatos:
-            path = os.path.normpath(os.path.join(self.cartas_dir, filename))
-            if not os.path.exists(path):
-                continue
-
-            base_name, ext = os.path.splitext(filename)
-            encontrados = [path]
-            i = 2
-            while True:
-                extra = os.path.normpath(
-                    os.path.join(self.cartas_dir, f"{base_name}_{i}{ext}")
-                )
-                if not os.path.exists(extra):
-                    break
-                encontrados.append(extra)
-                i += 1
-            return encontrados
-
-        logging.error(
-            f"Nenhum PDF encontrado para {credor.nome} nos candidatos: {candidatos}"
+        message.add_alternative(
+            renderizar_template_email(template, credor),
+            subtype="html",
         )
-        return []
+
+        for index, pdf_path in enumerate(pdf_paths):
+            pdf_data = pdf_path.read_bytes()
+            if not pdf_data:
+                raise ValueError(f"PDF vazio: {pdf_path.name}.")
+            message.add_attachment(
+                pdf_data,
+                maintype="application",
+                subtype="pdf",
+                filename=nome_anexo(credor, index),
+            )
+
+        return destinatario, message
 
     def _send_with_retries(
         self,
         destinatario: str,
-        message: MIMEMultipart,
-    ) -> Tuple[str, str]:
-        valid_modes = {"auto", "none", "starttls", "ssl"}
-        if self.security_mode not in valid_modes:
-            return (
-                "Falha",
-                "SMTP_SECURITY invalido. Use auto, none, starttls ou ssl.",
-            )
-        if not self.smtp_host:
-            return "Falha", "SMTP_HOST nao configurado"
-        if self.require_auth and not self.username:
-            return "Falha", "SMTP_USERNAME nao configurado"
-        if self.require_auth and not self.password:
-            return "Falha", "SMTP_PASSWORD nao configurado"
-
+        message: EmailMessage,
+    ) -> tuple[str, str]:
         for attempt in range(1, self.retries + 1):
             self._respect_rate_limit()
             try:
                 with self._connect() as client:
-                    client.send_message(message, from_addr=self.remetente, to_addrs=[destinatario])
+                    client.send_message(
+                        message,
+                        from_addr=self.remetente,
+                        to_addrs=[destinatario],
+                    )
                 self._sent_in_window += 1
                 return "Enviado", "N/A"
             except smtplib.SMTPResponseException as exc:
-                erro = f"{exc.smtp_code}: {self._decode_smtp_error(exc.smtp_error)}"
-                logging.warning(
-                    f"Tentativa {attempt} falhou no SMTP para {destinatario} - {erro}"
+                erro = (
+                    f"{exc.smtp_code}: "
+                    f"{self._decode_smtp_error(exc.smtp_error)}"
                 )
-                if attempt < self.retries and exc.smtp_code in {421, 450, 451, 452}:
-                    time.sleep(5)
+                retryable = exc.smtp_code in TRANSIENT_SMTP_CODES
+                if attempt < self.retries and retryable:
+                    time.sleep(self.retry_delay_seconds)
                     continue
                 return "Falha", erro
             except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
-                erro = str(exc)
-                logging.warning(
-                    f"Tentativa {attempt} falhou no SMTP para {destinatario} - {erro}"
-                )
                 if attempt < self.retries:
-                    time.sleep(5)
+                    time.sleep(self.retry_delay_seconds)
                     continue
-                return "Falha", erro
+                return "Falha", str(exc)
 
-        return "Falha", "Limite de tentativas atingido"
+        return "Falha", "Limite de tentativas atingido."
 
     def _connect(self):
-        if self.security_mode == "auto":
-            try:
-                return self._connect_with_mode("starttls")
-            except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
-                logging.warning(
-                    "Falha ao iniciar STARTTLS no modo auto; retomando sem criptografia. "
-                    f"Erro: {exc}"
-                )
-                return self._connect_with_mode("none")
-        return self._connect_with_mode(self.security_mode)
+        mode = self.security_mode
+        if mode == "auto":
+            mode = "ssl" if self.smtp_port == 465 else "starttls"
+        return self._connect_with_mode(mode)
 
     def _connect_with_mode(self, mode: str):
         context = ssl.create_default_context()
@@ -316,16 +214,19 @@ class SmtpEmailService:
             return raw_error.decode("utf-8", errors="replace")
         return str(raw_error)
 
-    def _respect_rate_limit(self):
-        now = time.time()
+    def _respect_rate_limit(self) -> None:
+        now = time.monotonic()
         elapsed = now - self._window_start
-        window_seconds = max(1, self.rate_limit_window_seconds)
-        if elapsed >= window_seconds:
+        if elapsed >= self.rate_limit_window_seconds:
             self._window_start = now
             self._sent_in_window = 0
-        if self._sent_in_window >= self.rate_limit_per_min:
-            wait = window_seconds - elapsed if elapsed < window_seconds else 0
-            if wait > 0:
-                time.sleep(wait)
-            self._window_start = time.time()
-            self._sent_in_window = 0
+            return
+
+        if self._sent_in_window < self.rate_limit:
+            return
+
+        wait = self.rate_limit_window_seconds - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        self._window_start = time.monotonic()
+        self._sent_in_window = 0

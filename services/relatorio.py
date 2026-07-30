@@ -1,11 +1,17 @@
+from pathlib import Path
+
 import pandas as pd
-from config import ARQUIVO_RELATORIO
+
+
+REPORT_COLUMNS = ["Destinatario", "Status do envio", "Erro"]
+
 
 class Relatorio:
-    def gerar_relatorio(self, resultados_envio):
-        df = pd.DataFrame(resultados_envio)
-        self.salvar_relatorio(df)
+    def __init__(self, arquivo_relatorio: str) -> None:
+        self.arquivo_relatorio = Path(arquivo_relatorio)
 
-    def salvar_relatorio(self, df):
-        df.to_excel(ARQUIVO_RELATORIO, index=False)
-        print(f"Relatório de bounces salvo em '{ARQUIVO_RELATORIO}'.")
+    def gerar_relatorio(self, resultados_envio) -> None:
+        dataframe = pd.DataFrame(resultados_envio, columns=REPORT_COLUMNS)
+        self.arquivo_relatorio.parent.mkdir(parents=True, exist_ok=True)
+        dataframe.to_excel(self.arquivo_relatorio, index=False)
+        print(f"Relatório de envio salvo em '{self.arquivo_relatorio}'.")

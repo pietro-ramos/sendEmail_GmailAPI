@@ -16,10 +16,8 @@ data/
 *.zip
 
 # Ignore credentials and token files
-credentials.json
-credentials_gmail_temp.json
-token.json
-token_gmail_temp.json
+credentials*.json
+token*.json
 
 # Ignore specific files
 corpos_emails_para_analise.txt

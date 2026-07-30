@@ -1,16 +1,20 @@
 import re
-from typing import Dict, List
+from pathlib import Path
 
 import pandas as pd
 
 
 def normalize_email(value: str) -> str:
-    return re.sub(r"\s+", "", (value or "").replace("\u00a0", "")).strip().lower()
+    return re.sub(
+        r"\s+",
+        "",
+        str(value or "").replace("\u00a0", ""),
+    ).strip().lower()
 
 
-def _localizar_coluna_destinatario(df: pd.DataFrame) -> str | None:
+def _localizar_coluna_destinatario(dataframe: pd.DataFrame) -> str | None:
     for candidate in ("Destinatario", "Destinatário"):
-        if candidate in df.columns:
+        if candidate in dataframe.columns:
             return candidate
     return None
 
@@ -19,20 +23,26 @@ def _status_enviado(value: str) -> bool:
     return str(value or "").strip().lower() == "enviado"
 
 
-def obter_destinatarios_relatorio(arquivo_relatorio: str) -> List[str]:
-    df = pd.read_excel(arquivo_relatorio)
-    dest_col = _localizar_coluna_destinatario(df)
-    if not dest_col:
-        return []
+def obter_destinatarios_relatorio(arquivo_relatorio: str) -> list[str]:
+    report_path = Path(arquivo_relatorio)
+    if not report_path.is_file():
+        raise FileNotFoundError(f"Relatório de envio não encontrado: {report_path}")
 
-    if "Status do envio" in df.columns:
-        df = df[df["Status do envio"].apply(_status_enviado)]
+    dataframe = pd.read_excel(report_path)
+    destination_column = _localizar_coluna_destinatario(dataframe)
+    if not destination_column:
+        raise ValueError("Coluna de destinatário não encontrada no relatório.")
 
-    destinatarios: List[str] = []
-    vistos: set[str] = set()
-    for value in df[dest_col].dropna().astype(str):
+    if "Status do envio" in dataframe.columns:
+        dataframe = dataframe[
+            dataframe["Status do envio"].apply(_status_enviado)
+        ]
+
+    destinatarios = []
+    vistos = set()
+    for value in dataframe[destination_column].dropna().astype(str):
         email = normalize_email(value)
-        if not email or email == "desconhecido" or email in vistos:
+        if not email or email in vistos:
             continue
         vistos.add(email)
         destinatarios.append(email)
@@ -40,56 +50,51 @@ def obter_destinatarios_relatorio(arquivo_relatorio: str) -> List[str]:
 
 
 def atualizar_relatorio_com_bounces(
-    bounces: List[Dict[str, str]],
+    bounces: list[dict[str, str]],
     arquivo_relatorio: str,
-) -> None:
+) -> int:
     if not bounces:
         print("Nenhum bounce encontrado.")
-        return
+        return 0
 
-    df = pd.read_excel(arquivo_relatorio)
-    dest_col = _localizar_coluna_destinatario(df)
-    if not dest_col:
-        print("Coluna de destinatário não encontrada no relatório; nenhuma linha atualizada.")
-        return
+    dataframe = pd.read_excel(arquivo_relatorio)
+    destination_column = _localizar_coluna_destinatario(dataframe)
+    if not destination_column:
+        raise ValueError("Coluna de destinatário não encontrada no relatório.")
 
-    status_col_existia = "Status do envio" in df.columns
-    if "Motivo do bounce" not in df.columns:
-        df["Motivo do bounce"] = ""
-    if "Status do envio" not in df.columns:
-        df["Status do envio"] = ""
-    for col in ("Status do envio", "Motivo do bounce", "Erro"):
-        if col in df.columns:
-            df[col] = df[col].astype("object")
+    status_column_existed = "Status do envio" in dataframe.columns
+    if "Motivo do bounce" not in dataframe.columns:
+        dataframe["Motivo do bounce"] = ""
+    if "Status do envio" not in dataframe.columns:
+        dataframe["Status do envio"] = ""
+    for column in ("Status do envio", "Motivo do bounce", "Erro"):
+        if column in dataframe.columns:
+            dataframe[column] = dataframe[column].astype("object")
 
-    df["__dest_norm"] = df[dest_col].astype(str).apply(normalize_email)
+    dataframe["__dest_norm"] = dataframe[destination_column].apply(
+        normalize_email
+    )
     linhas_atualizadas = 0
-    correspondencias = 0
 
     for bounce in bounces:
-        destinatario = bounce.get("Destinatario", "")
-        motivo_bounce = bounce.get("Motivo do bounce", "")
-        mask_destinatario = df["__dest_norm"] == normalize_email(destinatario)
-        correspondencias += int(mask_destinatario.sum())
+        destination = normalize_email(bounce.get("Destinatario", ""))
+        reason = bounce.get("Motivo do bounce", "")
+        mask = dataframe["__dest_norm"] == destination
+        if status_column_existed:
+            mask &= dataframe["Status do envio"].apply(_status_enviado)
 
-        if status_col_existia:
-            mask_status = df["Status do envio"].apply(_status_enviado)
-            mask = mask_destinatario & mask_status
-        else:
-            mask = mask_destinatario
+        if not mask.any():
+            continue
+        dataframe.loc[mask, "Status do envio"] = "Falha"
+        dataframe.loc[mask, "Motivo do bounce"] = reason
+        if "Erro" in dataframe.columns:
+            dataframe.loc[mask, "Erro"] = reason
+        linhas_atualizadas += int(mask.sum())
 
-        if mask.any():
-            df.loc[mask, "Status do envio"] = "Falha"
-            df.loc[mask, "Motivo do bounce"] = motivo_bounce
-            if "Erro" in df.columns:
-                df.loc[mask, "Erro"] = motivo_bounce
-            linhas_atualizadas += int(mask.sum())
-
-    df = df.drop(columns=["__dest_norm"])
-    df.to_excel(arquivo_relatorio, index=False)
+    dataframe = dataframe.drop(columns=["__dest_norm"])
+    dataframe.to_excel(arquivo_relatorio, index=False)
     print(
-        f"Bounces processados: {len(bounces)} | "
-        f"Correspondências no relatório: {correspondencias} | "
-        f"Linhas atualizadas: {linhas_atualizadas}"
+        f"Bounces encontrados: {len(bounces)} | "
+        f"linhas atualizadas: {linhas_atualizadas}."
     )
-    print(f"Relatório atualizado com bounces salvo em '{arquivo_relatorio}'.")
+    return linhas_atualizadas
