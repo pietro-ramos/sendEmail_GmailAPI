@@ -12,6 +12,7 @@ servidor SMTP genérico. Outlook permanece como provedor padrão.
   tentativas e intervalo entre retries;
 - localização do PDF por CPF/CNPJ e classe do credor;
 - anexos adicionais com sufixos `_2`, `_3` e seguintes;
+- preflight que monta e valida os payloads sem enviar mensagens;
 - relatório Excel com o resultado de cada destinatário;
 - captura de bounces no Outlook e no Gmail, atualizando o relatório de envio.
 
@@ -22,6 +23,7 @@ templates temporários não fazem parte desta base.
 
 ```text
 main.py                    ponto de entrada dos envios
+main_preflight.py          valida o lote e monta payloads sem enviar
 main_bounces.py            captura e conciliação de bounces
 config.py                  leitura e validação das variáveis de ambiente
 app/                       seleção e execução dos provedores
@@ -33,6 +35,7 @@ services/
   graph_email.py           envio pelo Outlook
   smtp_email.py            envio SMTP
   pdf_files.py             localização compartilhada dos PDFs
+  preflight.py             validação sintática e estrutural dos payloads
   bounce_*.py              captura e conciliação de bounces
 util/input_excel.py        leitura da planilha
 tests/                     testes sem acesso a provedores reais
@@ -75,6 +78,8 @@ O PDF é procurado nesta ordem:
 
 CPF/CNPJ é comparado apenas por dígitos. A classe é normalizada sem acentos e
 com `_` no lugar de pontuação. O alias legado `QUIROGRAF_RIO` continua aceito.
+Arquivos numerados, como `<documento>_<classe>_2.pdf`, também são reconhecidos
+quando não existe a variante sem contador.
 
 ## Provedores
 
@@ -86,7 +91,34 @@ Selecione um valor em `PROVEDOR_ENVIO`:
 | `gmail` | Gmail API | remetente, `credentials.json` e token OAuth |
 | `smtp` | SMTP genérico | host, porta, remetente, segurança e credenciais |
 
-Executar o lote:
+Antes de qualquer disparo, execute o preflight:
+
+```powershell
+.\.venv\Scripts\python.exe main_preflight.py
+```
+
+Ele percorre a planilha, localiza e lê os PDFs e monta o payload real do
+provedor selecionado, mas não obtém token, não abre conexão SMTP e não chama
+nenhuma API de envio. São validados:
+
+- formato sintático de remetentes e destinatários;
+- assunto e corpo HTML;
+- estrutura exigida pelo Microsoft Graph, Gmail ou SMTP;
+- presença, assinatura, conteúdo e codificação dos PDFs;
+- destinatários repetidos no lote, como aviso;
+- variáveis e arquivos essenciais do provedor.
+
+Use `--mostrar-aprovados` para listar também o tamanho e os anexos de cada
+payload válido. Use `--provider outlook`, `gmail` ou `smtp` para testar outro
+provedor sem alterar o `.env`. O comando termina com código `1` quando encontra
+qualquer erro, permitindo bloqueá-lo em scripts operacionais.
+
+O teste de endereço é preventivo e sintático: ele encontra valores como `-`,
+ausência de `@` e múltiplos destinatários na mesma célula, mas não confirma se
+a caixa postal existe. Essa confirmação e os bounces continuam sendo tratados
+após o envio.
+
+Com o preflight aprovado, execute o lote:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py
@@ -130,7 +162,7 @@ separado por ter escopo OAuth diferente do token de envio.
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m compileall -q app models services util main.py main_bounces.py
+.\.venv\Scripts\python.exe -m compileall -q app models services util main.py main_preflight.py main_bounces.py
 ```
 
 Os testes não enviam mensagens nem consultam caixas reais.

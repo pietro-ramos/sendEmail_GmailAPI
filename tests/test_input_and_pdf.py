@@ -70,6 +70,25 @@ class InputAndPdfTest(unittest.TestCase):
             ["123_II.pdf", "123_II_2.pdf"],
         )
 
+    def test_localiza_sufixo_sem_exigir_arquivo_principal(self) -> None:
+        credor = Credor(
+            nome="Banco",
+            classe="QUIROGRAFARIO",
+            valor="",
+            email="banco@example.com",
+            cpf_cnpj="123",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            (directory / "123_QUIROGRAFARIO_2.pdf").write_bytes(b"%PDF-2")
+
+            paths = localizar_pdfs(str(directory), credor)
+
+        self.assertEqual(
+            [path.name for path in paths],
+            ["123_QUIROGRAFARIO_2.pdf"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
